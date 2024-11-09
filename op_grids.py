@@ -1,10 +1,12 @@
 import os
 os.environ['OPENCV_VIDEOIO_DEBUG'] = '0'
 os.environ['OPENCV_VIDEOIO_PRIORITY_MSMF'] = '0'
-
 import numpy as np
 import cv2
 import math
+import torch
+from torchvision import transforms
+from PIL import Image
 
 class OccupancyGrid:
     def __init__(self, size=100):
@@ -16,6 +18,7 @@ class OccupancyGrid:
         self.size = size
         self.grid = np.zeros((size, size), dtype=np.uint8)
         self.center = (size // 2, size // 2)
+        self.cell_size = 0.5  # Each cell represents 0.5 meters
         
         # Define cell states
         self.UNKNOWN = 0
@@ -75,6 +78,18 @@ class OccupancyGrid:
         cv2.circle(vis_grid, self.center, 3, (255, 255, 0), -1)  # Yellow dot
         
         return vis_grid
+
+    def meters_to_cells(self, meters_x, meters_y):
+        """Convert real-world meters to grid cell coordinates"""
+        cell_x = int(meters_x / self.cell_size) + self.center[0]
+        cell_y = int(meters_y / self.cell_size) + self.center[1]
+        return cell_x, cell_y
+
+    def cells_to_meters(self, cell_x, cell_y):
+        """Convert grid cell coordinates to real-world meters"""
+        meters_x = (cell_x - self.center[0]) * self.cell_size
+        meters_y = (cell_y - self.center[1]) * self.cell_size
+        return meters_x, meters_y
 
 class CameraHandler:
     def __init__(self):
@@ -143,19 +158,112 @@ class CameraHandler:
         """Release the camera"""
         self.cap.release()
 
+class DepthEstimator:
+    def __init__(self):
+        """Initialize depth estimation models and parameters"""
+        # Initialize MiDaS model
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = torch.hub.load("intel-isl/MiDaS", "MiDaS_small")
+        self.model.to(self.device)
+        self.model.eval()
+        
+        # Modified transform to ensure consistent size
+        self.transform = transforms.Compose([
+            transforms.Resize((384, 384)),  # Fixed size
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                              std=[0.229, 0.224, 0.225])
+        ])
+        
+        # For traditional approach
+        self.feature_detector = cv2.SIFT_create()
+        self.previous_frame = None
+        self.previous_keypoints = None
+        self.previous_descriptors = None
+
+    def estimate_depth_ai(self, frame):
+        """Estimate depth using MiDaS"""
+        # Convert frame to PIL Image
+        image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        
+        # Transform image to fixed size
+        input_batch = self.transform(image).unsqueeze(0).to(self.device)
+
+        # Run inference
+        with torch.no_grad():
+            prediction = self.model(input_batch)
+            
+            # Resize back to original frame size
+            prediction = torch.nn.functional.interpolate(
+                prediction.unsqueeze(1),
+                size=(frame.shape[0], frame.shape[1]),  # Original frame size
+                mode="bicubic",
+                align_corners=False,
+            ).squeeze()
+
+        depth_map = prediction.cpu().numpy()
+        
+        # Normalize depth map for visualization
+        depth_map = (depth_map - depth_map.min()) / (depth_map.max() - depth_map.min())
+        depth_map = (depth_map * 255).astype(np.uint8)
+        
+        return depth_map
+
+    def estimate_depth_traditional(self, frame):
+        """Estimate depth using traditional computer vision"""
+        if self.previous_frame is None:
+            self.previous_frame = frame
+            self.previous_keypoints, self.previous_descriptors = \
+                self.feature_detector.detectAndCompute(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), None)
+            return None
+
+        # Detect features in current frame
+        current_keypoints, current_descriptors = \
+            self.feature_detector.detectAndCompute(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), None)
+
+        # Match features
+        matcher = cv2.BFMatcher()
+        matches = matcher.knnMatch(self.previous_descriptors, current_descriptors, k=2)
+
+        # Calculate relative depths from motion
+        depth_map = np.zeros(frame.shape[:2], dtype=np.float32)
+        for m, n in matches:
+            if m.distance < 0.75 * n.distance:  # Lowe's ratio test
+                pt1 = self.previous_keypoints[m.queryIdx].pt
+                pt2 = current_keypoints[m.trainIdx].pt
+                # Estimate relative depth from motion magnitude
+                motion = np.sqrt((pt2[0] - pt1[0])**2 + (pt2[1] - pt1[1])**2)
+                depth_map[int(pt2[1]), int(pt2[0])] = 1.0 / (motion + 1e-5)
+
+        self.previous_frame = frame
+        self.previous_keypoints = current_keypoints
+        self.previous_descriptors = current_descriptors
+        
+        # Normalize and smooth depth map
+        depth_map = cv2.GaussianBlur(depth_map, (15, 15), 0)
+        depth_map = (depth_map - depth_map.min()) / (depth_map.max() - depth_map.min() + 1e-5)
+        depth_map = (depth_map * 255).astype(np.uint8)
+        
+        return depth_map
+
 class GridMapper:
     def __init__(self, grid_size=100):
         self.grid = OccupancyGrid(size=grid_size)
         self.camera = CameraHandler()
+        self.depth_estimator = DepthEstimator()
         
         # Robot state
-        self.robot_pos = (grid_size // 2, grid_size // 2)  # Center of grid
-        self.robot_orientation = 0  # Degrees, 0 is facing positive X
+        self.robot_pos = (grid_size // 2, grid_size // 2)
+        self.robot_orientation = 0
         
         # Create windows
         cv2.namedWindow('Camera Feed', cv2.WINDOW_NORMAL)
+        cv2.namedWindow('Depth Map', cv2.WINDOW_NORMAL)
         cv2.namedWindow('Occupancy Grid', cv2.WINDOW_NORMAL)
         cv2.resizeWindow('Occupancy Grid', 800, 800)
+        
+        # Depth estimation mode
+        self.use_ai_depth = True  # Toggle between AI and traditional methods
     
     def calculate_fov_cells(self):
         """Calculate grid cells that fall within camera FOV"""
@@ -225,6 +333,56 @@ class GridMapper:
                             self.grid.OCCUPIED
                         )
     
+    def update_grid_from_depth(self, depth_map, frame_width, frame_height):
+        """Update grid using depth information"""
+        # Camera parameters (should be calibrated for your camera)
+        focal_length = frame_width / (2 * math.tan(math.radians(self.camera.fov_horizontal / 2)))
+        
+        for y in range(frame_height):
+            for x in range(frame_width):
+                depth = depth_map[y, x]
+                if depth > 10:  # Threshold to filter out noise
+                    # Convert pixel coordinates to world coordinates
+                    world_x = (x - frame_width/2) * depth / focal_length
+                    world_y = (y - frame_height/2) * depth / focal_length
+                    
+                    # Convert world coordinates (in mm) to meters
+                    world_x_m = world_x / 1000.0
+                    world_y_m = world_y / 1000.0
+                    
+                    # Convert to grid coordinates
+                    grid_x, grid_y = self.grid.meters_to_cells(world_x_m, world_y_m)
+                    
+                    if 0 <= grid_x < self.grid.size and 0 <= grid_y < self.grid.size:
+                        self.grid.update_cell(grid_x, grid_y, self.grid.OCCUPIED)
+                        
+                        # Mark cells between camera and object as free
+                        self.mark_free_path(grid_x, grid_y)
+
+    def mark_free_path(self, target_x, target_y):
+        """Mark cells between camera and target as free using Bresenham's line algorithm"""
+        x0, y0 = self.robot_pos
+        x1, y1 = target_x, target_y
+        
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+        x, y = x0, y0
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx - dy
+        
+        while x != x1 or y != y1:
+            if 0 <= x < self.grid.size and 0 <= y < self.grid.size:
+                self.grid.update_cell(x, y, self.grid.FREE)
+            
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                x += sx
+            if e2 < dx:
+                err += dx
+                y += sy
+    
     def run(self):
         """Main loop for mapping"""
         try:
@@ -233,19 +391,34 @@ class GridMapper:
                 if frame is None:
                     continue
                 
-                # Handle keyboard input for robot movement
+                # Handle keyboard input
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('q'):
                     break
-                elif key == ord('a'):  # Rotate left
+                elif key == ord('m'):  # Toggle depth estimation mode
+                    self.use_ai_depth = not self.use_ai_depth
+                elif key == ord('a'):
                     self.robot_orientation = (self.robot_orientation - 5) % 360
-                elif key == ord('d'):  # Rotate right
+                elif key == ord('d'):
                     self.robot_orientation = (self.robot_orientation + 5) % 360
                 
+                # Estimate depth
+                if self.use_ai_depth:
+                    depth_map = self.depth_estimator.estimate_depth_ai(frame)
+                else:
+                    depth_map = self.depth_estimator.estimate_depth_traditional(frame)
+                
+                if depth_map is not None:
+                    # Update grid using depth information
+                    self.update_grid_from_depth(depth_map, frame.shape[1], frame.shape[0])
+                    
+                    # Show depth map
+                    cv2.imshow('Depth Map', depth_map)
+                
+                # Update and show visualizations
                 self.update_grid_from_camera(frame)
                 grid_vis = self.grid.visualize()
                 
-                # Show both camera feed and grid
                 cv2.imshow('Camera Feed', frame)
                 cv2.imshow('Occupancy Grid', grid_vis)
                 
